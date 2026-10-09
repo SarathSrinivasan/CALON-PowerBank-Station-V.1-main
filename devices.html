@@ -1,0 +1,105 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#101113"><title>Availability | CALON</title><link rel="stylesheet" href="style.css"><script src="app.js" defer></script></head><body><div class="shell"><header class="topbar"><a class="brand" href="index.html"><span class="brandmark"></span><span>CALON</span></a><div class="mqtt-pill" data-mqtt-pill><span data-mqtt-label>Offline</span><span data-mqtt-dot></span></div></header><main class="app"><a class="back" href="rent.html">← Change plan</a><div class="app-head"><div class="eyebrow">Rental / Step 03</div><h1>Choose your power bank.</h1><p>Waiting for the STM32 station to publish available slots.</p></div><section class="card"><div id="mqttStatus" class="status"><span class="status-dot"></span><span>Waiting for station availability…</span></div><div id="devices" class="choices"></div><div id="empty" class="notice" style="margin-top:14px">No availability received yet. Keep this page open. The station should publish to <strong>POWERBANK/001/AVAILABILITY</strong>.</div><button id="continue" class="btn btn-gold" disabled style="width:100%;margin-top:16px">Continue to payment →</button><div id="flowError" class="flow-error hidden"></div></section><section class="card"><div class="rows"><div class="row"><span class="label">Request</span><span class="value" data-session-id>—</span></div><div class="row"><span class="label">Plan</span><span class="value" id="plan">—</span></div><div class="row"><span class="label">Availability topic</span><span class="value">POWERBANK/001/AVAILABILITY</span></div></div></section><details class="card"><summary style="font-weight:800">MQTT diagnostics</summary><div id="log" class="log" style="margin-top:12px"></div></details></main></div><script>
+let selected = null;
+let availabilityHandled = false;
+
+function renderDevices(data) {
+  // STM32 sends availability in data.slots. Accept the older devices format too.
+  const list = Array.isArray(data?.slots)
+    ? data.slots
+    : Array.isArray(data?.devices)
+      ? data.devices
+      : Array.isArray(data)
+        ? data
+        : [data];
+
+  const box = document.getElementById('devices');
+  box.innerHTML = '';
+
+  list.forEach(d => {
+    const itemAvailability = d.available ?? d.is_available;
+    const itemStatus = String(d.status || d.slot_status || '').trim().toUpperCase();
+    const available = itemAvailability !== undefined
+      ? (itemAvailability === true || itemAvailability === 1 || String(itemAvailability).toLowerCase() === 'true' || String(itemAvailability) === '1')
+      : (['AVAILABLE', 'EMPTY', 'READY', 'FREE'].includes(itemStatus) || data?.available === true || data?.available === 1 || String(data?.available).toLowerCase() === 'true');
+
+    if (!available) return;
+
+    const deviceId = d.powerbank_id || d.device_id || d.id || d.slot_id;
+    if (!deviceId) return;
+
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'choice';
+    b.innerHTML = `
+      <span>
+        <span class="choice-title">${esc(deviceId)}</span>
+        <span class="choice-sub">
+          Available${d.battery != null ? ' · ' + esc(d.battery) + '% battery' : ''}${d.slot_id ? ' · Slot ' + esc(d.slot_id) : ''}
+        </span>
+      </span>
+      <span class="price">SELECT</span>`;
+
+    b.onclick = () => {
+      document.querySelectorAll('#devices .choice').forEach(x => x.classList.remove('selected'));
+      b.classList.add('selected');
+      selected = {
+        deviceId,
+        battery: d.battery,
+        slotId: d.slot_id
+      };
+      document.getElementById('continue').disabled = false;
+    };
+
+    box.appendChild(b);
+  });
+
+  const hasDevices = box.children.length > 0;
+  document.getElementById('empty').classList.toggle('hidden', hasDevices);
+  document.getElementById('continue').disabled = !selected;
+
+  if (hasDevices) {
+    status('Availability received from STM32. Select your PowerBank.', 'success');
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  const s = getSession();
+  document.getElementById('plan').textContent = `${s.hours || '—'} hour · ₹${s.price || '—'}`;
+
+  onMessage(CALON.topics.availability, data => {
+    // Only accept availability for the active rental request.
+    const current = getSession();
+    if (!data?.request_id || !current.requestId || String(data.request_id).trim() !== String(current.requestId).trim()) {
+      log(`Ignored availability: expected request ${current.requestId || '(missing)'}, received ${data?.request_id || '(missing)'}`);
+      return;
+    }
+
+    // IMPORTANT: render only once. Later availability publications will not
+    // replace the customer's current choices on this page.
+    if (availabilityHandled) {
+      log('Availability already received; ignoring later update.');
+      return;
+    }
+
+    const slots = Array.isArray(data?.slots) ? data.slots : [];
+    if (!slots.length) {
+      log('Availability message received but slots array is empty.');
+      return;
+    }
+
+    availabilityHandled = true;
+    renderDevices(data);
+    log(`Displayed ${slots.length} slot(s) from STM32. Page is now locked to this availability response.`);
+  });
+
+  document.getElementById('continue').onclick = () => {
+    if (!selected) return;
+    setSession({
+      deviceId: selected.deviceId,
+      battery: selected.battery,
+      slotId: selected.slotId
+    });
+    location.href = 'payment.html';
+  };
+});
+</script></body></html>

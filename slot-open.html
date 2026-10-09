@@ -1,0 +1,107 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#101113"><title>Opening Slot | CALON</title><link rel="stylesheet" href="style.css"><script src="app.js" defer></script></head><body><div class="shell"><header class="topbar"><a class="brand" href="index.html"><span class="brandmark"></span><span>CALON</span></a><div class="mqtt-pill" data-mqtt-pill><span data-mqtt-label>Offline</span><span data-mqtt-dot></span></div></header><main class="app"><div class="app-head" style="margin-top:45px"><div class="eyebrow">Station action / Step 05</div><h1>Opening your slot.</h1><p>Payment is complete. We are waiting for the STM32 station to confirm the physical slot is open.</p></div><section class="card" style="text-align:center;padding:38px 25px"><div class="success-icon" style="background:#fff5e1;color:var(--gold);animation:pulse 1.4s infinite">⌁</div><h2 style="font:800 26px Manrope">Waiting for slot confirmation</h2><p style="color:var(--muted);line-height:1.7">The station should publish <strong>SLOT_OPENED</strong> on<br><strong>POWERBANK/001/SLOT_STATUS</strong>.</p><div id="mqttStatus" class="status"><span class="status-dot"></span><span>Waiting for STM32…</span></div><div id="slotInfo" class="notice" style="margin-top:12px">Slot: —</div><div id="flowError" class="flow-error hidden"></div></section><details class="card"><summary style="font-weight:800">Station diagnostics</summary><div id="log" class="log" style="margin-top:12px"></div></details></main></div><style>@keyframes pulse{50%{transform:scale(1.07);box-shadow:0 0 0 12px #c29a5012}}</style><script>
+document.addEventListener('DOMContentLoaded', () => {
+  const s = getSession();
+  const slotInfo = document.getElementById('slotInfo');
+  const command = String(s.openSlotCommand || s.slotId || '').trim();
+  let commandSent = false;
+  let completed = false;
+
+  // Show the selected slot from the saved browser session immediately.
+  slotInfo.textContent = command ? `Slot: ${command}` : 'Slot: —';
+  log(`Slot confirmation page loaded. Request=${s.requestId || 'missing'}, slot=${command || 'missing'}`);
+
+  function processSlotMessage(data, raw) {
+    log(`Received SLOT_STATUS payload: ${raw || JSON.stringify(data)}`);
+    if (completed || !data || typeof data !== 'object') return;
+
+    const eventName = String(data.event || '').toUpperCase();
+    const statusName = String(data.status || '').toUpperCase();
+    const isOpen = ['SLOT_OPENED', 'OPENED', 'RELEASED', 'SLOT_RELEASED'].includes(eventName) ||
+                   ['SLOT_OPENED', 'OPENED', 'RELEASED', 'SLOT_RELEASED'].includes(statusName) ||
+                   data.open === true || data.slot_open === true;
+    if (!isOpen) {
+      log('Ignoring SLOT_STATUS message: it is not a slot-open confirmation.');
+      return;
+    }
+
+    if (data.station_id && data.station_id !== CALON.stationId) {
+      log(`Ignored confirmation for station ${data.station_id}.`);
+      return;
+    }
+    if (s.requestId && data.request_id && data.request_id !== s.requestId) {
+      log(`Ignored stale confirmation for request ${data.request_id}; current request is ${s.requestId}.`);
+      return;
+    }
+    const confirmedSlot = String(data.slot_id || '');
+    if (command && confirmedSlot && confirmedSlot !== command) {
+      log(`Ignored confirmation for slot ${confirmedSlot}; expected ${command}.`);
+      return;
+    }
+
+    completed = true;
+    const shownSlot = confirmedSlot || command || 'Ready';
+    slotInfo.innerHTML = `<strong>Slot opened.</strong> ${esc(shownSlot)}<br>Collect your power bank now.`;
+    status('Slot opened by STM32.','success');
+    setSession({paymentPending:false, paymentSent:true, slotOpened:true, confirmedSlot:shownSlot, deviceId:data.device_id || s.deviceId || ''});
+    log('Valid slot-open confirmation accepted. Redirecting to Thank You.');
+    setTimeout(() => location.href = 'thankyou.html?flow=rent', 500);
+  }
+
+  // Register the message listener BEFORE publishing the command. This prevents a fast
+  // STM32 response from arriving while the browser is still on payment.html.
+  onMessage(CALON.topics.slot, processSlotMessage);
+  window.addEventListener('calon-message', event => {
+    const m = event.detail;
+    if (m && m.topic === CALON.topics.slot) processSlotMessage(m.data, m.raw);
+  });
+
+  window.addEventListener('calon-status', event => {
+    const state = event.detail?.status;
+    if (state === 'connected') sendCommandOnce();
+  });
+
+  function sendCommandOnce() {
+    if (commandSent || !command) return;
+    commandSent = true;
+    if (publish(CALON.topics.payment, command)) {
+      setSession({paymentPending:false, paymentSent:true, openSlotCommand:command});
+      status('Slot command sent. Waiting for STM32 confirmation…','warn');
+      log(`Published slot command once on ${CALON.topics.payment}: ${command}`);
+    } else {
+      commandSent = false;
+      status('Could not send slot command. Check MQTT connection.','error');
+      log('Slot command publish was not accepted by MQTT transport.');
+    }
+  }
+
+  if (!command) {
+    status('No selected slot found. Return to device selection and try again.','error');
+    showError('The selected slot ID is missing. Please return to device selection and try again.');
+    log('ERROR: openSlotCommand and slotId are both missing from session.');
+    return;
+  }
+
+  status('Connecting to station and preparing slot confirmation…','warn');
+  // If the shared MQTT connection is already ready, publish() can send now; otherwise
+  // wait for the connected event. The worker marks connected only after subscribing.
+  // Queue through publish only once connected, to keep this page's listener active first.
+  const waitForConnected = () => {
+    if (commandSent) return;
+    const label = document.querySelector('[data-mqtt-label]')?.textContent;
+    if (label === 'Connected') sendCommandOnce();
+  };
+  waitForConnected();
+  const poll = setInterval(() => {
+    waitForConnected();
+    if (commandSent || completed) clearInterval(poll);
+  }, 250);
+  setTimeout(() => {
+    if (!commandSent && !completed) {
+      clearInterval(poll);
+      status('Station connection is not ready.','error');
+      showError('Could not connect to the station. Keep this page open and refresh after MQTT reconnects.');
+      log('TIMEOUT: MQTT did not become connected within 20 seconds; slot command was not sent.');
+    }
+  }, 20000);
+});
+</script></body></html>

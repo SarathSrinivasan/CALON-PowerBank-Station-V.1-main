@@ -1,0 +1,90 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#101113"><title>Checking Availability | CALON</title><link rel="stylesheet" href="style.css"><script src="app.js" defer></script></head><body><div class="shell"><header class="topbar"><a class="brand" href="index.html"><span class="brandmark"></span><span>CALON</span></a><div class="mqtt-pill" data-mqtt-pill><span data-mqtt-label>Offline</span><span data-mqtt-dot></span></div></header><main class="app"><div class="app-head"><div class="eyebrow">Rental / Step 03</div><h1>Checking availability.</h1><p>CALON is waiting for the STM32 station to publish the available power banks.</p></div><section class="card" style="text-align:center"><div class="success-icon" style="background:#fff5e1;color:var(--gold);animation:pulse 1.4s infinite">⌁</div><h2 style="font:800 25px Manrope">Waiting for station…</h2><p id="message" style="color:var(--muted);line-height:1.7">Do not refresh this page. When availability arrives, CALON will automatically open the power-bank selection page.</p><div id="mqttStatus" class="status"><span class="status-dot"></span><span>Waiting for AVAILABILITY…</span></div><div id="flowError" class="flow-error hidden"></div></section><details class="card"><summary style="font-weight:800">MQTT diagnostics</summary><div id="log" class="log" style="margin-top:12px"></div></details></main></div><style>@keyframes pulse{50%{transform:scale(1.07);box-shadow:0 0 0 12px #c29a5012}}</style><script>
+document.addEventListener('DOMContentLoaded',()=>{
+  let handled=false;
+  const s=getSession();
+  if(!s.requestId){showError('Rental request ID is missing. Please start a new rental.');return;}
+  const processAvailability=(data)=>{
+    if(handled || !data || typeof data!=='object') return;
+    const current=getSession();
+    const receivedId=String(data.request_id||'').trim();
+    const expectedId=String(current.requestId||'').trim();
+    if(!receivedId || receivedId!==expectedId){
+      log(`Ignored AVAILABILITY: expected request ID ${expectedId||'(missing from browser session)'}; received ${receivedId||'(missing)'}. STM32 must echo the exact request_id.`);
+      return;
+    }
+    const slots=Array.isArray(data.slots)?data.slots:Array.isArray(data.devices)?data.devices:Array.isArray(data)?data:[];
+    if(!slots.length){
+      if(data.available===false || String(data.status||'').toUpperCase()==='NO_SLOT'){
+        status('Station responded: no power banks available.','error');
+        document.getElementById('message').textContent='The station replied, but no power bank is currently available. Please try again later.';
+        log('AVAILABILITY matched this request, but station reported no available slots.');
+      } else log('AVAILABILITY matched this request, but slots/devices array is empty.');
+      return;
+    }
+    // Some STM32 builds set availability only at the top level. If an item has
+    // no per-slot availability field, inherit data.available instead of dropping it.
+    const available=slots.filter(d=>{
+      if(!d || typeof d!=='object') return false;
+      const raw=d.available ?? d.is_available;
+      if(raw!==undefined) return raw===true || raw===1 || String(raw).toLowerCase()==='true' || String(raw)==='1';
+      const state=String(d.status||d.slot_status||'').trim().toUpperCase();
+      if(state) return ['AVAILABLE','EMPTY','READY','FREE'].includes(state);
+      return data.available===true || data.available===1 || String(data.available).toLowerCase()==='true';
+    });
+    if(!available.length){
+      status('Availability received, but no slot is marked available.','error');
+      document.getElementById('message').textContent='STM32 responded to this request, but none of its slots was marked available. Check the slot fields in the MQTT payload.';
+      log('AVAILABILITY request_id matched, but slot entries were not marked available. Expected slots[].available=true or top-level available=true.');
+      return;
+    }
+    handled=true;
+    setSession({availability:available,availabilityReceived:true});
+    status(`Received ${available.length} available slot(s). Opening selection…`,'success');
+    document.getElementById('message').textContent='Power banks are available. Opening selection…';
+    log(`Accepted AVAILABILITY for request ${data.request_id}; opening select.html.`);
+    setTimeout(()=>{location.href='select.html';},350);
+  };
+  const processError=(data)=>{
+    if(!data || typeof data!=='object') return;
+    const current=getSession();
+    if(data.request_id && data.request_id!==current.requestId){log(`Ignored ERROR for another request: ${data.request_id}`);return;}
+    const message=String(data.message||data.code||'Station reported an error');
+    status('STM32 reported an error: '+message,'error');
+    document.getElementById('message').textContent='The station did not accept this request. Please check the station state before trying again.';
+    showError('STM32: '+message+(data.code?' ('+data.code+')':''));
+    log('STM32 ERROR: '+JSON.stringify(data));
+  };
+  // Subscribe/register before sending so a fast STM32 response cannot be missed.
+  onMessage(CALON.topics.availability,processAvailability);
+  onMessage(CALON.topics.error,processError);
+  window.addEventListener('calon-message',event=>{
+    const m=event.detail;
+    if(m?.topic===CALON.topics.availability) processAvailability(m.data);
+    if(m?.topic===CALON.topics.error) processError(m.data);
+  });
+  status('Preparing one rental request…','warn');
+  if(!s.requestSent){
+    const payload={event:'RENT_REQUESTED',station_id:CALON.stationId,request_id:s.requestId,customer_id:s.customerId||id('CUS')};
+    setSession({requestSent:true,requestSentAt:new Date().toISOString()});
+    if(publish(CALON.topics.rent,payload)){
+      status('Rent request sent once. Waiting for STM32 availability…','warn');
+      document.getElementById('message').textContent='Rent request sent. Waiting for the STM32 station to publish available slots.';
+      log('Published one RENT_REQUESTED for '+s.requestId+'. No RENT_PLAN_SELECTED message is sent.');
+      window.setTimeout(()=>{
+        if(!handled && !document.getElementById('flowError').classList.contains('hidden')) return;
+        if(!handled){
+          status('No matching STM32 availability response yet.','error');
+          document.getElementById('message').textContent='The request was sent once, but no matching availability response arrived. Check STM32 transaction state, request_id echo, MQTT subscription and firmware logs. The page will not resend automatically.';
+          log('TIMEOUT: no matching AVAILABILITY received within 15 seconds. No automatic duplicate request was sent.');
+        }
+      },15000);
+    } else {
+      setSession({requestSent:false});
+      showError('MQTT publish failed. Check the connection and try again.');
+    }
+  } else {
+    status('Request already sent. Waiting for STM32 availability…','warn');
+    log('Not resending RENT_REQUESTED because this request ID was already sent.');
+  }
+});
+</script></body></html>
